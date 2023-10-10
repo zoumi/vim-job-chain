@@ -1,22 +1,22 @@
 ﻿
-"a dict of job:{node:JobChainNode,job_idx:int}
+"a dict of job chain:{node:JobChainNode,job_idx:int}
 if !exists('g:chain_node_info_job_dict')
     let g:chain_node_info_job_dict = {}
 endif
 
 func! _comment()
-" next_node will be execute only when all nodes in node_list and all jobs in
-" job_list finished and all their close_cb returns true
-" function close_cb(channel) should returns a bool
+" function close_cb(channel,job=v:null) should returns a bool
+" 'next_node' will be execute only when all nodes in node_list and all jobs in
+" job_list finished and all their close_cb returns true.
 " when a chain node is finished, the finished_cb will be called 
 " node in node_list is executed parallelly
 " job in job_list is executed parallelly
 Job{
     name:'',
     job_cmd:'', "must provided
+    job_arg:'',
     pre_do:func,
     pre_do_args_list:[],
-    job_arg:''
 }
 
 JobChainNode
@@ -39,14 +39,14 @@ endfunc
 
 func! s:try_finish_parent_node(node)
     let parent_node = a:node._parent_node
-    while parent_node != v:null
+    while parent_node isnot v:null
         let status = vim_job_chain#get_chain_node_status(parent_node)
         if (status == 'finish')  && (parent_node._status != 'finish')
             let parent_node._status = 'finish'
             if has_key(parent_node,'finished_cb')
                 call parent_node.finished_cb(parent_node)
             endif
-            if parent_node.next_node != v:null
+            if parent_node.next_node isnot v:null
                 call s:execute_chain_node(parent_node.next_node,a:node)
             endif
         endif
@@ -56,7 +56,7 @@ endfunc
 
 func! s:set_parent_node_failed(node)
     let parent_node = a:node._parent_node
-    while parent_node != v:null
+    while parent_node isnot v:null
         if parent_node._status != 'fail'
             let parent_node._status = 'fail'
             if has_key(parent_node,'finished_cb')
@@ -83,13 +83,13 @@ func! s:wrapped_job_cb(channel)
         if has_key(job.job_arg,'close_cb')
             let Cb = function(job.job_arg.close_cb)
             try
-                let job_result = Cb(a:channel)
+                let job_result = Cb(a:channel,job)
             catch /.*/
                 let job_result = v:false
                 let err_info = "close_cb error: " . v:exception . " in " . v:throwpoint
             endtry
         else
-            let job_result = vim_job_chain#default_close_cb(a:channel)
+            let job_result = vim_job_chain#default_close_cb(a:channel,job)
         endif
         if job_result
             let node._job_status_list[job_idx] = 'finish' 
@@ -115,7 +115,7 @@ func! s:wrapped_job_cb(channel)
                     " throw "finished_cb error: " . v:exception
                 endtry
             endif
-            if node.next_node != v:null
+            if node.next_node isnot v:null
                 " execute next node
                 " next_node's parent is same as current node
                 call s:execute_chain_node(node.next_node,node._parent_node)
@@ -131,7 +131,7 @@ func! s:wrapped_job_cb(channel)
         echoerr "Get un-recorded job:"
     endif
     call remove(g:chain_node_info_job_dict,j_id)
-    if err_info != v:null
+    if err_info isnot v:null
         throw err_info
     endif
 endfunc
@@ -189,7 +189,7 @@ func! s:pre_do(j,node)
             endtry
         endif
     endif
-    if err_info != v:null
+    if err_info isnot v:null
         throw err_info
     endif
 endfunc
@@ -226,7 +226,12 @@ func! s:execute_chain_node(node,parent_node = v:null) abort
             let j_i = job_info(j_o)
             if j_i.status != 'run'
                 let a:node._job_status_list[j_idx] = 'fail'
-                echoerr "start job failed with exit code: " . string(j_i.exitval)
+                let channel =  job_getchannel(j_o)
+                let std_err = ""
+                if ch_status(channel, {'part': 'err'}) == 'buffered'
+                    let std_err = ch_readraw(a:channel, {"part": "err"})
+                endif
+                echoerr "start job failed with exit code: " . string(j_i.exitval) . " err msg:" . channel
             else
                 let j_id = join(j_i.cmd) . '#' . j_i.process
                 " echomsg "create job " . j_id
@@ -257,7 +262,7 @@ func! s:execute_chain_node(node,parent_node = v:null) abort
             call a:node.finished_cb(node)
         endif
 
-        if a:node.next_node != v:null
+        if a:node.next_node isnot v:null
             " execute next node
             " next_node's parent is same as current node
             call s:execute_chain_node(a:node.next_node,a:node._parent_node)
@@ -272,7 +277,7 @@ func! s:execute_chain_node(node,parent_node = v:null) abort
     if node_status == 'fail'
         " all parent should be marked as 'fail'
         let parent_node = a:node._parent_node
-        while parent_node != v:null
+        while parent_node isnot v:null
             if parent_node._status != 'fail'
                 let parent_node._status = 'fail'
                 if has_key(parent_node,'finished_cb')
@@ -291,16 +296,55 @@ func! vim_job_chain#execute_chain_node(node,parent_node = v:null) abort
     return node
 endfunc
 
-func! vim_job_chain#default_close_cb(channel)
+func! vim_job_chain#get_job_result(channel)
+    let job = ch_getjob(a:channel)
+    " echomsg job_status(job)
+    let job_info = job_info(job)
+    " echomsg  job_info
+    "exit_code: ok:0 error: not 0
+    let exit_code = job_info.exitval
+
+    let std_err = ''
+    if ch_status(a:channel, {'part': 'err'}) == 'buffered'
+        let std_err = ch_readraw(a:channel, {"part": "err"})
+    endif
+
+    " echomsg ch_info(a:channel)
+    let std_out = ''
+    if ch_status(a:channel, {'part': 'out'}) == 'buffered'
+        let std_out= ch_readraw(a:channel)
+        " echomsg 'std_out:' . std_output
+    endif
+    return {'exit_code':exit_code,
+                \ 'std_err':std_err,
+                \ 'std_out':std_out}
+endfunc
+
+func! vim_job_chain#default_close_cb(channel,job)
     let job = ch_getjob(a:channel)
     let job_info = job_info(job)
     return job_info.exitval == 0
 endfunc
 
+func! vim_job_chain#simple_close_cb(channel,job)
+    let job_re = vim_job_chain#get_job_result(a:channel)
+    let job_name = get(a:job,'name','NoName')
+    if job_re.exit_code == 0
+        if job_re.std_out != ''
+            echomsg job_name . ' std_out:' . job_re.std_out
+        endif
+        echomsg job_name . ' success.'
+        return v:true
+    else
+        echoerr job_name . ' failed:' . job_re.std_err
+    endif
+    return v:false
+endfunc
+
 func! vim_job_chain#append_chain(node,next_node) abort
     let tmp_node = a:node
     while 1
-        if tmp_node.next_node == v:null
+        if tmp_node.next_node is v:null
             let tmp_node.next_node = a:next_node
             break
         else
@@ -314,7 +358,7 @@ func! vim_job_chain#deepcopy_append_chain(node,next_node) abort
     let re_node = deepcopy(a:node)
     let tmp_node = re_node
     while 1
-        if tmp_node.next_node == v:null
+        if tmp_node.next_node is v:null
             let tmp_node.next_node = deepcopy(a:next_node)
             break
         else
@@ -362,261 +406,3 @@ func! vim_job_chain#build_from_jobs(jobs) abort
     return re
 endfunc
 
-func! s:test() abort
-    func! s:job1_cb(channel)
-        echomsg "job1_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job2_cb(channel)
-        echomsg "job2_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job3_cb(channel)
-        echomsg "job3_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job4_cb(channel)
-        echomsg "job4_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job5_cb(channel)
-        echomsg "job5_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job6_cb(channel)
-        echomsg "job6_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job7_cb(channel)
-        echomsg "job7_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job8_cb(channel)
-        echomsg "job8_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job9_cb(channel)
-        echomsg "job9_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job10_cb(channel)
-        echomsg "job10_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job11_cb(channel)
-        echomsg "job11_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job12_cb(channel)
-        echomsg "job12_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job13_cb(channel)
-        echomsg "job13_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job14_cb(channel)
-        echomsg "job14_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job15_cb(channel)
-        echomsg "job15_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job16_cb(channel)
-        echomsg "job16_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job17_cb(channel)
-        echomsg "job17_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job18_cb(channel)
-        echomsg "job18_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job19_cb(channel)
-        echomsg "job19_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job20_cb(channel)
-        echomsg "job20_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job21_cb(channel)
-        echomsg "job21_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job22_cb(channel)
-        echomsg "job22_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job23_cb(channel)
-        echomsg "job23_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job24_cb(channel)
-        echomsg "job24_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-    func! s:job25_cb(channel)
-        echomsg "job25_cb" | return vim_job_chain#default_close_cb(a:channel)
-    endfunc
-
-
-    let job1 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job1_cb','mode':'raw'}}
-    let job2 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job2_cb','mode':'raw'}}
-    let job3 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job3_cb','mode':'raw'}}
-    let job4 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job4_cb','mode':'raw'}}
-    let job5 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job5_cb','mode':'raw'}}
-    let job6 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job6_cb','mode':'raw'}}
-    let job7 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job7_cb','mode':'raw'}}
-    let job8 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job8_cb','mode':'raw'}}
-    let job9 =  {'job_cmd':'git --help','job_arg':{'close_cb':'s:job9_cb','mode':'raw'}}
-    let job10 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job10_cb','mode':'raw'}}
-    let job11 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job11_cb','mode':'raw'}}
-    let job12 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job12_cb','mode':'raw'}}
-    let job13 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job13_cb','mode':'raw'}}
-    let job14 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job14_cb','mode':'raw'}}
-    let job15 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job15_cb','mode':'raw'}}
-    let job16 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job16_cb','mode':'raw'}}
-    let job17 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job17_cb','mode':'raw'}}
-    let job18 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job18_cb','mode':'raw'}}
-    let job19 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job19_cb','mode':'raw'}}
-    let job20 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job20_cb','mode':'raw'}}
-    let job21 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job21_cb','mode':'raw'}}
-    let job22 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job22_cb','mode':'raw'}}
-    let job23 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job23_cb','mode':'raw'}}
-    let job24 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job24_cb','mode':'raw'}}
-    let job25 = {'job_cmd':'git --help','job_arg':{'close_cb':'s:job25_cb','mode':'raw'}}
-
-    let job_chain = { 
-                \ 'job_list':[job1,job2],
-                \ 'name': 'node1',
-                \ 'node_list':[
-                \     {
-                    \         'name': 'node2',
-                    \         'job_list':[job3,job4],
-                    \         'node_list':[],
-                    \         'next_node':{
-                    \             'name': 'node3',
-                    \             'job_list':[job5,job6],
-                    \             'node_list':[],
-                    \             'next_node':v:null
-                    \         }
-                    \     },
-                    \     {
-                        \         'job_list':[job7,job8],
-                        \         'node_list':[],
-                        \         'next_node':{
-                        \             'name': 'node4',
-                        \             'job_list':[job9,job10],
-                        \             'node_list':[],
-                        \             'next_node':{
-                        \                 'name': 'node5',
-                        \                 'job_list':[job11,job12],
-                        \                 'node_list':[],
-                        \                 'next_node':v:null
-                        \             }
-                        \         }
-                        \     },
-                        \ ],
-                        \ 'next_node':{
-                        \    'name': 'node6',
-                        \    'job_list':[job13,job14],
-                        \    'node_list':[
-                        \        {
-                            \            'name': 'node7',
-                            \            'job_list':[],
-                            \            'node_list':[],
-                            \            'next_node':{
-                            \                'name': 'node8',
-                            \                'job_list':[job15,job16],
-                            \                'node_list':[],
-                            \                'next_node':{
-                            \                    'name': 'node9',
-                            \                    'job_list':[job17],
-                            \                    'node_list':[],
-                            \                   'next_node':v:null
-                            \                }
-                            \            }
-                            \        },
-                            \    ],
-                            \    'next_node':{
-                            \       'name': 'node10',
-                            \       'job_list':[job18],
-                            \       'node_list':[],
-                            \       'next_node':{
-                            \           'name': 'node11',
-                            \           'job_list':[job19],
-                            \           'node_list':[],
-                            \           'next_node':{
-                            \               'name': 'node12',
-                            \               'job_list':[job20],
-                            \               'node_list':[],
-                            \               'next_node':v:null
-                            \           }
-                            \       }
-                            \    }
-                            \ }
-                            \ }
-
-    call vim_job_chain#execute_chain_node(job_chain,v:null)
-
-
-    let job_chain2 = { 
-                \ 'job_list':[job1,job2],
-                \ 'name': 'node1',
-                \ 'node_list':[],
-                \ 'next_node': {
-                \     'name': 'node2',
-                \     'job_list':[job3,job4],
-                \     'node_list':[],
-                \     'next_node':{
-                \         'name': 'node3',
-                \         'job_list':[job5,job6],
-                \         'node_list':[],
-                \         'next_node':v:null
-                \         }
-                \     },
-                \ }
-
-    let job_chain3 = {
-                \ 'job_list':[job7,job8],
-                \ 'name': 'node4',
-                \ 'node_list':[],
-                \ 'next_node': {
-                \     'name': 'node5',
-                \     'job_list':[job9,job10],
-                \     'node_list':[],
-                \     'next_node':{
-                \         'name': 'node6',
-                \         'job_list':[job11,job12],
-                \         'node_list':[],
-                \         'next_node':v:null
-                \         }
-                \     },
-                \ }
-
-    let job_chain4 = vim_job_chain#deepcopy_append_chain(job_chain2,job_chain3)
-
-    call vim_job_chain#append_chain(job_chain2,job_chain3)
-    if job_chain2.next_node.next_node.next_node.name != 'node4'
-        echoerr 'vim_job_chain#append test failed'
-    endif
-
-    if job_chain2.next_node.next_node.next_node.next_node.name != 'node5'
-        echoerr 'vim_job_chain#append test failed'
-    endif
-
-    if job_chain4 != job_chain2
-        echoerr 'vim_job_chain#deepcopy_append test failed'
-    endif
-
-    let job_chain5 = vim_job_chain#build_from_jobs([job1,[job2,job3],job4])
-    call vim_job_chain#chain_with_jobs(job_chain5,[[job5,job6],job7])
-    " let @+ = string(job_chain5)
-    " echomsg string(job_chain5)
-endfunc
-
-" call s:test()
